@@ -2271,4 +2271,57 @@ mod test {
             ]
         );
     }
+
+    /// `(1, 10)` is delivered in an earlier epoch. An upsert overwrite followed by a delete of the
+    /// same key in one epoch must still emit the delete, even if the two are in different chunks.
+    #[tokio::test]
+    async fn test_force_compaction_upsert_input_keeps_final_delete() {
+        use risingwave_common::array::StreamChunkTestExt;
+
+        let input = vec![
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(1))),
+            Message::Chunk(StreamChunk::from_pretty(
+                " I I
+                + 1 10",
+            )),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(2))),
+            Message::Chunk(StreamChunk::from_pretty(
+                " I I
+                + 1 20
+                + 2 5",
+            )),
+            Message::Chunk(StreamChunk::from_pretty(
+                " I I
+                - 1 .",
+            )),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(3))),
+        ];
+        let output = run_sink_executor(
+            maplit::btreemap! {
+                "connector".into() => "blackhole".into(),
+                "force_compaction".into() => "true".into()
+            },
+            SinkType::Upsert,
+            StreamKind::Upsert,
+            vec![0],
+            vec![0],
+            input,
+        )
+        .await;
+
+        assert_eq!(
+            output,
+            vec![
+                StreamChunk::from_pretty(
+                    " I I
+                    + 1 10",
+                ),
+                StreamChunk::from_pretty(
+                    " I I
+                    - 1 .
+                    + 2 5",
+                ),
+            ]
+        );
+    }
 }

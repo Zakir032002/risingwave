@@ -631,7 +631,8 @@ impl<F: LogStoreFactory> SinkExecutor<F> {
                         let mut delete_chunks = vec![];
                         let mut insert_chunks = vec![];
 
-                        let compactor = StreamChunkCompactor::new(stream_key.clone(), chunks);
+                        let compactor = StreamChunkCompactor::new(stream_key.clone(), chunks)
+                            .with_upsert_input(input_is_upsert);
                         let compacted = if downstream_pk.is_some() && !input_is_upsert {
                             compactor.into_compacted_chunks_inline::<{ output_kind::RETRACT }>(
                                 input_compact_ib,
@@ -665,7 +666,9 @@ impl<F: LogStoreFactory> SinkExecutor<F> {
                                 .chain(insert_chunks.into_iter())
                                 .collect();
                             let chunks = dispatch_output_kind!(sink_type, KIND, {
+                                // The output of step 1 is in upsert form if the input is upsert.
                                 StreamChunkCompactor::new(downstream_pk.clone(), chunks)
+                                    .with_upsert_input(input_is_upsert)
                                     .into_compacted_chunks_reconstructed::<KIND>(
                                         chunk_size,
                                         input_data_types.clone(),
@@ -736,6 +739,7 @@ impl<F: LogStoreFactory> SinkExecutor<F> {
                                     compact_chunk_inline::<KIND>(
                                         chunk,
                                         downstream_pk,
+                                        input_is_upsert,
                                         // When compacting based on user provided primary key, we should never panic
                                         // on inconsistency in case the user provided primary key is not unique.
                                         InconsistencyBehavior::Warn,
@@ -820,6 +824,10 @@ impl<F: LogStoreFactory> SinkExecutor<F> {
                         compact_chunk_inline::<KIND>(
                             chunk,
                             downstream_pk,
+                            // Chunks of an upsert sink may have been converted to upsert form by
+                            // the writer-side compaction and recombined in the log store, so an
+                            // `Insert` may overwrite a row from another chunk.
+                            sink_param.sink_type == SinkType::Upsert,
                             // When compacting based on user provided primary key, we should never panic
                             // on inconsistency in case the user provided primary key is not unique.
                             InconsistencyBehavior::Warn,

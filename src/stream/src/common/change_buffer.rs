@@ -68,11 +68,20 @@ struct Slot<R> {
 }
 
 /// A buffer that accumulates changes and produce compacted changes.
+///
+/// By default, the input is treated as a **retract** stream, where every `Delete` removes a row
+/// that is known to exist, so an `Insert` followed by a `Delete` of the same key cancels out.
+///
+/// With [`ChangeBuffer::with_upsert_input`], the input is treated as an **upsert** stream: an
+/// `Insert` may overwrite a row that was delivered earlier, and a `Delete` only carries the key.
+/// The buffer then keeps the last operation of each key, including the tombstone of a `Delete`,
+/// because nothing in the buffer tells whether the key exists downstream.
 #[derive(Debug)]
 pub struct ChangeBuffer<K, R> {
     // We use an `IndexMap` to preserve the original order of the changes as much as possible.
     buffer: IndexMap<K, Slot<R>>,
     ib: InconsistencyBehavior,
+    upsert_input: bool,
 }
 
 impl<K, R> ChangeBuffer<K, R>
@@ -82,6 +91,19 @@ where
 {
     /// Apply an insertion of a row with the given key.
     pub fn insert(&mut self, key: K, new_row: R) {
+        if self.upsert_input {
+            // The old side is irrelevant once there is a new row, as it is always emitted as an
+            // `Insert`.
+            self.buffer.insert(
+                key,
+                Slot {
+                    old: None,
+                    new: Some(new_row),
+                },
+            );
+            return;
+        }
+
         let entry = self.buffer.entry(key);
         match entry {
             Entry::Vacant(e) => {
@@ -102,6 +124,19 @@ where
 
     /// Apply a deletion of a row with the given key.
     pub fn delete(&mut self, key: K, old_row: R) {
+        if self.upsert_input {
+            // Keep the tombstone even if a row of this key was inserted in the buffer, since the
+            // insertion may have overwritten a row that exists downstream.
+            self.buffer.insert(
+                key,
+                Slot {
+                    old: Some(old_row),
+                    new: None,
+                },
+            );
+            return;
+        }
+
         let entry = self.buffer.entry(key);
         match entry {
             Entry::Vacant(e) => {
@@ -129,6 +164,13 @@ where
 
     /// Apply an update of a row with the given key.
     pub fn update(&mut self, key: K, old_row: R, new_row: R) {
+        if self.upsert_input {
+            // The old row carries no information in an upsert stream, so this is an overwrite.
+            let _ = old_row;
+            self.insert(key, new_row);
+            return;
+        }
+
         let entry = self.buffer.entry(key);
         match entry {
             Entry::Vacant(e) => {
@@ -185,11 +227,16 @@ where
 
     /// Consume the buffer and produce a list of change records.
     ///
-    /// No-op updates are filtered out.
+    /// For retract input, no-op updates are filtered out.
+    ///
+    /// For upsert input, each key yields either an `Insert` of the final row or a `Delete`, and
+    /// nothing is filtered out, since the old row does not reflect the downstream state.
     pub fn into_records(self) -> impl Iterator<Item = Record<R>> {
+        let upsert_input = self.upsert_input;
         self.buffer
             .into_values()
-            .filter_map(|slot| match (slot.old, slot.new) {
+            .filter_map(move |slot| match (slot.old, slot.new) {
+                (_, Some(new_row)) if upsert_input => Some(Record::Insert { new_row }),
                 (None, Some(new_row)) => Some(Record::Insert { new_row }),
                 (Some(old_row), None) => Some(Record::Delete { old_row }),
                 (Some(old_row), Some(new_row)) => {
@@ -217,7 +264,14 @@ impl<K, R> ChangeBuffer<K, R> {
         Self {
             buffer: IndexMap::with_capacity(capacity),
             ib: InconsistencyBehavior::Panic,
+            upsert_input: false,
         }
+    }
+
+    /// Treat the input as an upsert stream. See [`ChangeBuffer`] for the semantics.
+    pub fn with_upsert_input(mut self, upsert_input: bool) -> Self {
+        self.upsert_input = upsert_input;
+        self
     }
 
     /// Set the inconsistency behavior.

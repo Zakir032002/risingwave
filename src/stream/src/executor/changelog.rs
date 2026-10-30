@@ -26,6 +26,7 @@ use risingwave_common::hash::VirtualNode;
 use risingwave_common::row::{OwnedRow, RowExt};
 use risingwave_common::types::{DataType, ScalarImpl, Serial};
 use risingwave_common::util::row_id::ChangelogRowIdGenerator;
+use risingwave_pb::stream_plan::stream_node::StreamKind;
 
 use super::{ActorContextRef, BoxedMessageStream, Execute, Executor, Message, StreamExecutorError};
 use crate::common::change_buffer::InconsistencyBehavior;
@@ -144,6 +145,7 @@ impl ChangeLogExecutor {
             self.output_data_types(),
         );
         let mut chunk_buffer: Vec<StreamChunk> = vec![];
+        let input_is_upsert = self.input.stream_kind() == StreamKind::Upsert;
         let input = self.input.execute();
 
         #[for_await]
@@ -156,6 +158,7 @@ impl ChangeLogExecutor {
                         compaction_keys.clone(),
                         std::mem::take(&mut chunk_buffer),
                     )
+                    .with_upsert_input(input_is_upsert)
                     .into_compacted_chunks_inline::<RETRACT>(InconsistencyBehavior::Warn);
 
                     let mut deletes = Vec::with_capacity(chunks.len());
@@ -254,7 +257,7 @@ mod tests {
 
     use super::*;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::{ActorContext, Barrier};
+    use crate::executor::{ActorContext, Barrier, ExecutorInfo};
 
     #[tokio::test]
     async fn test_keyed_changelog_reorders_replacement() {
@@ -343,6 +346,69 @@ mod tests {
         assert!(
             old_delete_id < new_insert_id,
             "old deletion must precede replacement insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_keyed_changelog_upsert_input_keeps_final_delete() {
+        // `(1, 10)` was delivered in an earlier epoch. Overwriting it and deleting it in the same
+        // epoch must still emit the deletion.
+        let source = MockSource::with_messages(vec![
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(1))),
+            Message::Chunk(StreamChunk::from_pretty("I I\n+ 1 10")),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(2))),
+            Message::Chunk(StreamChunk::from_pretty("I I\n+ 1 20\n- 1 .")),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(3))),
+        ])
+        .stop_on_finish(false)
+        .boxed();
+        let source = Executor::new(
+            ExecutorInfo {
+                stream_kind: StreamKind::Upsert,
+                ..ExecutorInfo::for_test(
+                    Schema::new(vec![
+                        Field::unnamed(DataType::Int64),
+                        Field::unnamed(DataType::Int64),
+                    ]),
+                    vec![0],
+                    "MockSource".to_owned(),
+                    0,
+                )
+            },
+            source,
+        );
+
+        let mut output = ChangeLogExecutor::new(
+            ActorContext::for_test(1),
+            source,
+            true,
+            VirtualNode::COUNT_FOR_TEST,
+            Bitmap::ones(VirtualNode::COUNT_FOR_TEST),
+            ChangeLogMode::Keyed,
+            vec![0],
+            vec![0],
+        )
+        .boxed()
+        .execute();
+
+        let mut events = Vec::new();
+        while let Some(message) = output.next().await {
+            if let Message::Chunk(chunk) = message.unwrap() {
+                for (_, row) in chunk.rows() {
+                    let Some(ScalarRefImpl::Int64(key)) = row.datum_at(0) else {
+                        panic!("expected a non-null changelog key");
+                    };
+                    let Some(ScalarRefImpl::Int16(change_op)) = row.datum_at(2) else {
+                        panic!("expected a non-null changelog operation");
+                    };
+                    events.push((key, change_op));
+                }
+            }
+        }
+
+        assert_eq!(
+            events,
+            vec![(1, Op::Insert.to_i16()), (1, Op::Delete.to_i16())]
         );
     }
 
